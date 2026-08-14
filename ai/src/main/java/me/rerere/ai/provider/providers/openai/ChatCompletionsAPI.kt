@@ -1,10 +1,12 @@
 package me.rerere.ai.provider.providers.openai
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.channels.onFailure
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
@@ -71,6 +73,34 @@ import kotlin.time.Clock
 
 private const val TAG = "ChatCompletionsAPI"
 
+// DeepSeek 专属：HTTP 错误码细分（对齐 DSH 的稳定错误码）
+private const val ERR_AUTH = "AUTH"
+private const val ERR_QUOTA = "QUOTA"
+private const val ERR_RATE_LIMIT = "RATE_LIMIT"
+private const val ERR_CONTEXT_WINDOW = "CONTEXT_WINDOW_EXCEEDED"
+private const val ERR_INVALID = "INVALID_REQUEST"
+private const val ERR_SERVER = "SERVER"
+
+private fun classifyHttpError(code: Int, body: String): String = when {
+    code == 401 || code == 403 -> ERR_AUTH
+    code == 402 -> ERR_QUOTA
+    code == 429 -> ERR_RATE_LIMIT
+    code == 400 && (
+        body.contains("context", ignoreCase = true) ||
+            body.contains("length", ignoreCase = true) ||
+            body.contains("token", ignoreCase = true)
+        ) -> ERR_CONTEXT_WINDOW
+    code in 400..499 -> ERR_INVALID
+    code >= 500 -> ERR_SERVER
+    else -> "HTTP_$code"
+}
+
+private fun backoffDelayMs(attempt: Int): Long = when (attempt) {
+    1 -> 500L
+    2 -> 2000L
+    else -> 4000L
+}
+
 class ChatCompletionsAPI(
     private val client: OkHttpClient,
     private val keyRoulette: KeyRoulette
@@ -80,50 +110,71 @@ class ChatCompletionsAPI(
         messages: List<UIMessage>,
         params: TextGenerationParams,
     ): TextGenerationResult = withContext(Dispatchers.IO) {
-        val requestBody =
-            buildChatCompletionRequest(
-                messages = messages,
-                params = params,
-                providerSetting = providerSetting
-            )
+        // DeepSeek 专属：限流/服务端错误自动重试；其它 provider 保持原行为（maxRetries=0）
+        val isDeepSeek = providerSetting.baseUrl.contains("deepseek", ignoreCase = true)
+        val maxRetries = if (isDeepSeek) 2 else 0
 
-        val request = Request.Builder()
-            .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
-            .headers(params.customHeaders.toHeaders())
-            .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
-            .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
-            .configureReferHeaders(providerSetting.baseUrl)
-            .build()
+        var attempt = 0
+        while (true) {
+            try {
+                val requestBody =
+                    buildChatCompletionRequest(
+                        messages = messages,
+                        params = params,
+                        providerSetting = providerSetting
+                    )
 
-        Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
+                val request = Request.Builder()
+                    .url("${providerSetting.baseUrl}${providerSetting.chatCompletionsPath}")
+                    .headers(params.customHeaders.toHeaders())
+                    .post(json.encodeToString(requestBody).toRequestBody("application/json".toMediaType()))
+                    .addHeader("Authorization", "Bearer ${keyRoulette.next(providerSetting.apiKey, providerSetting.id.toString())}")
+                    .configureReferHeaders(providerSetting.baseUrl)
+                    .build()
 
-        val response = client.newCall(request).await()
-        if (!response.isSuccessful) {
-            throw Exception("Failed to get response: ${response.code} ${response.body?.string()}")
+                Log.i(TAG, "generateText: ${json.encodeToString(requestBody)}")
+
+                val response = client.newCall(request).await()
+                if (!response.isSuccessful) {
+                    val code = response.code
+                    val body = response.body?.string() ?: ""
+                    val errorType = classifyHttpError(code, body)
+                    val retryable = errorType == ERR_RATE_LIMIT || errorType == ERR_SERVER
+                    if (retryable && attempt < maxRetries) {
+                        attempt++
+                        Log.w(TAG, "generateText: $errorType ($code), retry #$attempt")
+                        delay(backoffDelayMs(attempt))
+                        continue
+                    }
+                    throw Exception("[$errorType] Failed to get response: $code $body")
+                }
+
+                val bodyStr = response.body?.string() ?: ""
+                val bodyJson = json.parseToJsonElement(bodyStr).jsonObject
+
+                // 从 JsonObject 中提取必要的信息
+                val id = bodyJson["id"]?.jsonPrimitive?.contentOrNull ?: ""
+                val model = bodyJson["model"]?.jsonPrimitive?.contentOrNull ?: ""
+                val choice = bodyJson["choices"]?.jsonArray?.get(0)?.jsonObject ?: error("choices is null")
+
+                val message = choice["message"]?.jsonObject ?: throw Exception("message is null")
+                val finishReason = choice["finish_reason"]
+                    ?.jsonPrimitive
+                    ?.content
+                    ?: "unknown"
+                val usage = parseTokenUsage(bodyJson["usage"] as? JsonObject)
+
+                return@withContext TextGenerationResult(
+                    id = id,
+                    model = model,
+                    message = parseMessage(message),
+                    finishReason = finishReason,
+                    usage = usage
+                )
+            } catch (e: CancellationException) {
+                throw e
+            }
         }
-
-        val bodyStr = response.body?.string() ?: ""
-        val bodyJson = json.parseToJsonElement(bodyStr).jsonObject
-
-        // 从 JsonObject 中提取必要的信息
-        val id = bodyJson["id"]?.jsonPrimitive?.contentOrNull ?: ""
-        val model = bodyJson["model"]?.jsonPrimitive?.contentOrNull ?: ""
-        val choice = bodyJson["choices"]?.jsonArray?.get(0)?.jsonObject ?: error("choices is null")
-
-        val message = choice["message"]?.jsonObject ?: throw Exception("message is null")
-        val finishReason = choice["finish_reason"]
-            ?.jsonPrimitive
-            ?.content
-            ?: "unknown"
-        val usage = parseTokenUsage(bodyJson["usage"] as? JsonObject)
-
-        TextGenerationResult(
-            id = id,
-            model = model,
-            message = parseMessage(message),
-            finishReason = finishReason,
-            usage = usage
-        )
     }
 
     override suspend fun streamText(

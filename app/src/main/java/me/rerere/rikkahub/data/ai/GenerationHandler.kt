@@ -40,6 +40,10 @@ import me.rerere.rikkahub.data.ai.transformers.onGenerationFinish
 import me.rerere.rikkahub.data.ai.transformers.transforms
 import me.rerere.rikkahub.data.ai.transformers.visualTransforms
 import me.rerere.rikkahub.data.ai.tools.buildMemoryTools
+import me.rerere.rikkahub.data.ai.tools.createAskUserTool
+import me.rerere.rikkahub.data.ai.tools.createTodoTools
+import me.rerere.rikkahub.data.ai.tools.TodoState
+import me.rerere.rikkahub.data.ai.tools.createSubagentTool
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -54,6 +58,7 @@ import kotlin.uuid.Uuid
 private const val TAG = "GenerationHandler"
 private const val MAX_TOOL_OUTPUT_CHARS = 32 * 1024
 private const val TOOL_OUTPUT_PREVIEW_CHARS = 4 * 1024
+private const val DEEPSEEK_MAX_TOKENS = 256_000
 
 @Serializable
 sealed interface GenerationChunk {
@@ -68,6 +73,8 @@ class GenerationHandler(
     private val json: Json,
     private val memoryRepo: MemoryRepository,
 ) {
+    private val compactionHandler = CompactionHandler()
+
     fun generateText(
         settings: Settings,
         model: Model,
@@ -89,10 +96,14 @@ class GenerationHandler(
 
         var messages: List<UIMessage> = messages
 
+        // DeepSeek 专属优化：仅对 DeepSeek 启用，其它 provider 零影响
+        val isDeepSeek = DeepSeekOpt.isDeepSeek(provider, model)
+        val todoState = if (isDeepSeek) TodoState() else null
+
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
-            val toolsInternal = buildList {
+            val baseTools = buildList {
                 Log.i(TAG, "generateInternal: build tools($assistant)")
                 if (assistant?.enableMemory == true) {
                     val memoryAssistantId = if (assistant.useGlobalMemory) {
@@ -114,6 +125,20 @@ class GenerationHandler(
                     ).let(this::addAll)
                 }
                 addAll(tools)
+                if (isDeepSeek && todoState != null) {
+                    addAll(createTodoTools(json, todoState))
+                    add(createAskUserTool())
+                }
+            }
+            val toolsInternal = if (isDeepSeek) {
+                buildList {
+                    addAll(baseTools)
+                    add(createSubagentTool { prompt ->
+                        runSubagent(prompt, providerImpl, provider, model, baseTools)
+                    })
+                }
+            } else {
+                baseTools
             }
 
             // Check if we have tool calls ready to continue after user interaction.
@@ -161,6 +186,7 @@ class GenerationHandler(
                     conversationModeInjectionIds = conversationModeInjectionIds,
                     conversationLorebookIds = conversationLorebookIds,
                     workspaceCwd = workspaceCwd,
+                    isDeepSeek = isDeepSeek,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -360,7 +386,23 @@ class GenerationHandler(
         conversationModeInjectionIds: Set<Uuid> = emptySet(),
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
+        isDeepSeek: Boolean = false,
     ) {
+        // DeepSeek 专属：上下文超限时摘要压缩旧消息（而非简单丢弃）
+        var effectiveMessages = messages
+        var summaryText: String? = null
+        if (isDeepSeek) {
+            val compacted = compactionHandler.maybeCompact(
+                messages = messages,
+                contextMessageLimit = assistant.contextMessageLimit,
+                providerImpl = providerImpl,
+                provider = provider,
+                model = model,
+            )
+            summaryText = compacted.summary
+            effectiveMessages = compacted.messages
+        }
+
         val internalMessages = buildList {
             val system = buildString {
                 val effectiveSystemPrompt =
@@ -383,9 +425,15 @@ class GenerationHandler(
                     appendLine()
                     append(tool.systemPrompt(model, messages))
                 }
+                // DeepSeek 压缩摘要
+                if (!summaryText.isNullOrBlank()) {
+                    appendLine()
+                    append("[Earlier conversation summary]\n")
+                    append(summaryText)
+                }
             }
             if (system.isNotBlank()) add(UIMessage.system(prompt = system))
-            addAll(messages.limitContext(assistant.contextMessageLimit))
+            addAll(effectiveMessages.limitContext(assistant.contextMessageLimit))
         }.transforms(
             transformers = transformers,
             context = context,
@@ -403,7 +451,7 @@ class GenerationHandler(
             model = model,
             temperature = assistant.temperature,
             topP = assistant.topP,
-            maxTokens = assistant.maxTokens,
+            maxTokens = assistant.maxTokens ?: if (isDeepSeek) DEEPSEEK_MAX_TOKENS else null,
             tools = tools,
             reasoningLevel = assistant.reasoningLevel,
             customHeaders = buildList {
@@ -434,6 +482,63 @@ class GenerationHandler(
             messages = messages.handleTextGenerationResult(result = result, model = model)
             onUpdateMessages(messages)
         }
+    }
+
+    private suspend fun runSubagent(
+        prompt: String,
+        providerImpl: Provider<ProviderSetting>,
+        provider: ProviderSetting,
+        model: Model,
+        tools: List<Tool>,
+    ): String {
+        var subMessages = listOf(
+            UIMessage.system(
+                "You are a subagent completing a delegated subtask. " +
+                    "Use the available tools to finish the task, then return a concise " +
+                    "final report of what you did and what you found."
+            ),
+            UIMessage.user(prompt),
+        )
+        val maxSubSteps = 15
+        repeat(maxSubSteps) {
+            val params = TextGenerationParams(
+                model = model,
+                tools = tools,
+                reasoningLevel = ReasoningLevel.OFF,
+            )
+            val result = providerImpl.generateText(
+                providerSetting = provider,
+                messages = subMessages,
+                params = params,
+            )
+            val assistantMsg = result.message
+            subMessages = subMessages + assistantMsg
+            val toolCalls = assistantMsg.getTools().filter { !it.isExecuted }
+            if (toolCalls.isEmpty()) {
+                return assistantMsg.toText().ifBlank { "(subagent returned empty result)" }
+            }
+            val executed = toolCalls.map { tc ->
+                val toolDef = tools.find { it.name == tc.toolName }
+                val output = if (toolDef == null) {
+                    listOf(UIMessagePart.Text("Error: unknown tool ${tc.toolName}"))
+                } else {
+                    runCatching {
+                        val args = json.parseToJsonElement(tc.input.ifBlank { "{}" })
+                        toolDef.execute(args)
+                    }.getOrElse {
+                        listOf(UIMessagePart.Text("Error: ${it.message}"))
+                    }
+                }
+                tc.copy(output = output)
+            }
+            val updatedParts = assistantMsg.parts.map { part ->
+                if (part is UIMessagePart.Tool) {
+                    executed.find { it.toolCallId == part.toolCallId } ?: part
+                } else part
+            }
+            subMessages = subMessages.dropLast(1) + assistantMsg.copy(parts = updatedParts)
+        }
+        return subMessages.lastOrNull()?.toText() ?: "(subagent exceeded max steps)"
     }
 
     private fun maybeTruncateToolOutput(

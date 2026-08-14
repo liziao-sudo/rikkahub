@@ -64,6 +64,7 @@ android {
                     storePassword = storePasswordValue
                     keyAlias = keyAliasValue
                     keyPassword = keyPasswordValue
+                    storeType = "PKCS12"
                 }
             }
         }
