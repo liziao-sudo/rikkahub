@@ -175,6 +175,7 @@ class ChatCompletionsAPI(
                 throw e
             }
         }
+        throw IllegalStateException("unreachable")
     }
 
     override suspend fun streamText(
