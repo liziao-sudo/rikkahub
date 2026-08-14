@@ -78,11 +78,10 @@ jobs:
 
       - name: Prepare build files
         run: |
-          printf 'storeFile=signing/rikkahub.p12
-storePassword=rikkahub2026
-keyAlias=rikkahub
-keyPassword=rikkahub2026
-' > local.properties
+          echo "storeFile=signing/rikkahub.p12" > local.properties
+          echo "storePassword=rikkahub2026" >> local.properties
+          echo "keyAlias=rikkahub" >> local.properties
+          echo "keyPassword=rikkahub2026" >> local.properties
 
       - name: Gradle Build
         run: |
