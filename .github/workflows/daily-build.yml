@@ -78,7 +78,7 @@ jobs:
 
       - name: Prepare build files
         run: |
-          echo "storeFile=signing/rikkahub.p12" > local.properties
+          echo "storeFile=../signing/rikkahub.p12" > local.properties
           echo "storePassword=rikkahub2026" >> local.properties
           echo "keyAlias=rikkahub" >> local.properties
           echo "keyPassword=rikkahub2026" >> local.properties
