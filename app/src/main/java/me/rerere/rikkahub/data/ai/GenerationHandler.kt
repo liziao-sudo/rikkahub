@@ -100,6 +100,12 @@ class GenerationHandler(
         val isDeepSeek = DeepSeekOpt.isDeepSeek(provider, model)
         val todoState = if (isDeepSeek) TodoState() else null
 
+        // 任务感知 reasoning 路由（DeepSeek 专属）：分类第一条用户消息
+        val routerMode = if (isDeepSeek) {
+            val firstUserText = messages.firstOrNull { it.role == MessageRole.USER }?.toText().orEmpty()
+            ReasoningRouter.classify(firstUserText)
+        } else null
+
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
@@ -187,6 +193,7 @@ class GenerationHandler(
                     conversationLorebookIds = conversationLorebookIds,
                     workspaceCwd = workspaceCwd,
                     isDeepSeek = isDeepSeek,
+                    routerMode = routerMode,
                 )
                 messages = messages.visualTransforms(
                     transformers = outputTransformers,
@@ -387,6 +394,7 @@ class GenerationHandler(
         conversationLorebookIds: Set<Uuid> = emptySet(),
         workspaceCwd: String? = null,
         isDeepSeek: Boolean = false,
+        routerMode: Int? = null,
     ) {
         // DeepSeek 专属：上下文超限时摘要压缩旧消息（而非简单丢弃）
         var effectiveMessages = messages
@@ -425,6 +433,11 @@ class GenerationHandler(
                     appendLine()
                     append(tool.systemPrompt(model, messages))
                 }
+                // DeepSeek 任务感知路由指令（weak 内路由，Pro 最优）
+                if (isDeepSeek) {
+                    appendLine()
+                    append(ReasoningRouter.CLASSIFY_INSTRUCTION)
+                }
                 // DeepSeek 压缩摘要
                 if (!summaryText.isNullOrBlank()) {
                     appendLine()
@@ -453,7 +466,11 @@ class GenerationHandler(
             topP = assistant.topP,
             maxTokens = assistant.maxTokens ?: if (isDeepSeek) DEEPSEEK_MAX_TOKENS else null,
             tools = tools,
-            reasoningLevel = assistant.reasoningLevel,
+            reasoningLevel = if (isDeepSeek && assistant.reasoningLevel == ReasoningLevel.AUTO) {
+                ReasoningRouter.reasoningFor(routerMode) ?: assistant.reasoningLevel
+            } else {
+                assistant.reasoningLevel
+            },
             customHeaders = buildList {
                 addAll(assistant.customHeaders)
                 addAll(model.customHeaders)
