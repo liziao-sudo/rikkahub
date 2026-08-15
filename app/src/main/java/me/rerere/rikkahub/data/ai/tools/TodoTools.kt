@@ -55,9 +55,6 @@ fun createTodoTools(json: Json, state: TodoState): List<Tool> = listOf(
                                 })
                                 put("detail", buildJsonObject { put("type", "string") })
                             })
-                            put("required", buildJsonObject {
-                                put("type", "array")
-                            })
                         })
                     })
                 },
