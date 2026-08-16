@@ -54,7 +54,7 @@ fun createCommunityTool(): Tool = Tool(
                     val fullName = item.getString("full_name")
                     val desc = item.optString("description", "")
                     val stars = item.optInt("stargazers_count", 0)
-                    sb.append("- $full_name (⭐$stars): $desc\n")
+                    sb.append("- ${fullName} (⭐$stars): $desc\n")
                 }
                 listOf(UIMessagePart.Text(sb.toString().trimEnd()))
             }
