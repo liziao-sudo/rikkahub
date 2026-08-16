@@ -168,10 +168,7 @@ class ChatVM(
 
     // Update checker
     val updateState = settingsStore.settingsFlow
-        .map { settings ->
-            !settings.init &&
-                settings.displaySetting.updateCheckDisabledUntilEpochMillis <= System.currentTimeMillis()
-        }
+        .map { false } // 禁用更新提示（自用 fork）
         .distinctUntilChanged()
         .flatMapLatest { enabled ->
             if (enabled) updateChecker.checkUpdate() else flowOf(UiState.Loading)

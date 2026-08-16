@@ -44,6 +44,8 @@ import me.rerere.rikkahub.data.ai.tools.createAskUserTool
 import me.rerere.rikkahub.data.ai.tools.createTodoTools
 import me.rerere.rikkahub.data.ai.tools.TodoState
 import me.rerere.rikkahub.data.ai.tools.createSubagentTool
+import me.rerere.rikkahub.data.ai.tools.createPluginTools
+import me.rerere.rikkahub.data.ai.tools.createCommunityTool
 import me.rerere.rikkahub.data.datastore.Settings
 import me.rerere.rikkahub.data.datastore.findModelById
 import me.rerere.rikkahub.data.datastore.findProvider
@@ -74,6 +76,7 @@ class GenerationHandler(
     private val memoryRepo: MemoryRepository,
 ) {
     private val compactionHandler = CompactionHandler()
+    private val pluginManager by lazy { PluginManager(context, json) }
 
     fun generateText(
         settings: Settings,
@@ -106,6 +109,10 @@ class GenerationHandler(
             ReasoningRouter.classify(firstUserText)
         } else null
 
+        // 插件系统（全局）：加载已安装插件 + 注入插件管理工具 + 社区
+        val pluginTools = createPluginTools(pluginManager) + createCommunityTool()
+        val installedPlugins = pluginManager.loadPlugins()
+
         for (stepIndex in 0 until maxSteps) {
             Log.i(TAG, "streamText: start step #$stepIndex (${model.id})")
 
@@ -135,6 +142,9 @@ class GenerationHandler(
                     addAll(createTodoTools(json, todoState))
                     add(createAskUserTool())
                 }
+                // 插件工具 + 已安装插件（全局）
+                addAll(pluginTools)
+                addAll(installedPlugins)
             }
             val toolsInternal = if (isDeepSeek) {
                 buildList {
